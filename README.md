@@ -34,7 +34,7 @@ what turns that into an actual CLI invocation.
 | `Plugins/llm_plugin_codex.py` | Codex CLI adapter. Same design as the Claude adapter, adapted to Codex's `exec`/`-c` config-override mechanics. |
 | `Plugins/llm_plugin_cline.py`, `llm_plugin_aider.py` | Oracle-delivered adapters. Support write-back by editing `write_enabled_files` in place. |
 | `Plugins/llm_plugin_probe.py` | No-op diagnostic adapter -- confirms the named-pipe handshake without invoking a model. |
-| `MCPServers/ps_mcp_server.py` | Stdio MCP server over PSAIAPI. `MODE=read` (default) exposes `get_*_details`/`get_*_peoplecode` lookups; `compile`/`write` modes add compile and stage/save tools, unused by any adapter yet. |
+| `MCPServers/ps_mcp_server.py` | MCP server over PSAIAPI. `MODE=read` (default) exposes `get_*_details`/`get_*_peoplecode` lookups; `compile`/`write` modes add compile and stage/save tools, unused by any adapter yet. Runs as a persistent background process (`TRANSPORT=streamable-http`) when started via `ensure_mcp_server_running`; also runnable standalone over stdio (the default) for manual testing. |
 | `Skills/peoplecode-generation/` | PeopleCode syntax + built-in-function verification guardrail. Claude/Codex bundle its reference files as static context (no tool access to fetch on demand); a tool-capable assistant could load it as an on-demand Skill instead. |
 | `SystemPrompts/READ_MODE_AGENTS.md`, `WRITE_MODE_AGENTS.md` | Oracle-delivered persona/constraints, selected by whether write-back is enabled. |
 | `UserRules/RULES.md` | House PeopleCode conventions, appended to every adapter's `AGENTS.md`. |
@@ -51,6 +51,24 @@ what turns that into an actual CLI invocation.
   can look up records, pages, components, app classes, App Engine programs,
   and projects on demand instead of guessing from whatever App Designer
   happened to export.
+- **The MCP server is persistent, not spawned per turn.** PSIDE spawns a
+  brand-new `llm_plugin_<name>.py` process (and a brand-new `claude`/`codex`
+  process) for every single "Ask AI" click -- but a fresh `ps_mcp_server.py`
+  per turn would mean re-authenticating to the database on every single
+  question. Both adapters call `LLMPluginBase.ensure_mcp_server_running()`
+  first: it probes `127.0.0.1:8933`, and only if nothing answers there does
+  it start `ps_mcp_server.py` as a detached background process
+  (`TRANSPORT=streamable-http`). Every subsequent turn, from either adapter,
+  finds that same server already up and reuses its already-authenticated
+  session. The server signs itself off and exits after 2 hours idle
+  (`IDLE_SHUTDOWN_SECONDS`) so an abandoned one doesn't run forever; kill it
+  manually (it logs itself as `python ... ps_mcp_server.py`) to force a
+  fresh sign-on sooner, e.g. after switching users.
+- The first tool call after that server starts blocks on a native sign-on
+  dialog (Connection Type/Database Name are fixed and read-only; **User ID**
+  is editable -- it's pre-filled from a registry cache that isn't always the
+  operator actually signing on, so correct it there if needed) for up to 90
+  seconds, then every later tool call -- from any turn -- returns instantly.
 - Requires Python 3.12+ on Windows, and the respective CLI
   (`claude`/`codex`) installed, authenticated, and on `PATH`.
 - `ps_mcp_server.py` requires the `mcp` package, **pinned below 2.0**

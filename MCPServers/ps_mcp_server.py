@@ -14,6 +14,7 @@ import os
 import re
 import signal
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox
 import winreg
@@ -38,9 +39,27 @@ _COMPILE_MODE: bool = _MODE == "compile"
 _WRITE_MODE: bool = _MODE == "write"
 _SAVE_READ_OUTPUT: bool = _MODE in {"compile", "write"}
 
+# Transport: "stdio" (default) spawns one server per client, 1:1, and tears
+# down with it -- fine for ad hoc/manual runs, but it means re-authenticating
+# to the database on every single invocation. "streamable-http" runs one
+# long-lived server on localhost that many separate client processes (one
+# per "Ask AI" turn) can share, authenticating once for the life of the
+# server instead of once per turn. See LLMPluginBase.ensure_mcp_server_running.
+VALID_TRANSPORTS = {"stdio", "streamable-http"}
+_TRANSPORT: str = os.getenv("TRANSPORT", "stdio").strip().lower()
+if _TRANSPORT not in VALID_TRANSPORTS:
+    raise ValueError(f"Invalid TRANSPORT '{_TRANSPORT}'. Expected one of: {', '.join(sorted(VALID_TRANSPORTS))}")
+_PORT: int = int(os.getenv("PORT", "8933"))
+# Only meaningful for streamable-http: shut down (and sign off) after this
+# long with no tool calls, so an abandoned persistent server doesn't hold a
+# live database session open indefinitely.
+_IDLE_SHUTDOWN_SECONDS: float = float(os.getenv("IDLE_SHUTDOWN_SECONDS", str(2 * 60 * 60)))
+
 # --- Global State ---
 
-mcp = FastMCP("PSIDEAPI")
+mcp = FastMCP("PSIDEAPI", host="127.0.0.1", port=_PORT)
+_LAST_ACTIVITY: float = 0.0  # set on server start and on every tool call; see _touch_activity()
+_ACTIVITY_LOCK: threading.Lock = threading.Lock()
 _PSAIAPI: Optional[ctypes.CDLL] = None
 _SIGNED_OFF: bool = False
 _INIT_LOCK: threading.Lock = threading.Lock()
@@ -52,6 +71,13 @@ _AUTH_FAILED = "failed"
 _AUTH_STATE = _AUTH_PENDING
 _WARMUP_ERROR: Optional[str] = None
 _AUTH_STATE_LOCK: threading.Lock = threading.Lock()
+_AUTH_READY_EVENT: threading.Event = threading.Event()
+# A single-shot MCP client spawns a fresh server per turn: the first tool
+# call must block for the sign-on dialog's outcome instead of failing fast,
+# or that client's turn (and the server process with it) ends before a
+# human can respond to the dialog. Comfortably longer than the dialog's own
+# _PASSWORD_TIMEOUT_SECONDS plus DLL-load/authentication time.
+_TOOL_AUTH_WAIT_SECONDS = 90
 _STAGED_PEOPLECODE: List[tuple] = []
 _STAGE_COUNTER: int = 0
 _API_LOCK: threading.Lock = threading.Lock()  # Serializes all DLL access and staging operations
@@ -63,6 +89,8 @@ def _set_auth_state(state: str, error: Optional[str] = None) -> None:
     with _AUTH_STATE_LOCK:
         _AUTH_STATE = state
         _WARMUP_ERROR = error
+    if state in (_AUTH_READY, _AUTH_FAILED):
+        _AUTH_READY_EVENT.set()
 
 
 def _get_auth_status() -> Tuple[str, Optional[str]]:
@@ -72,14 +100,20 @@ def _get_auth_status() -> Tuple[str, Optional[str]]:
 
 # --- Password Dialog Functions ---
 
-def _dialog_ok(root: tk.Tk, pwd_entry: tk.Entry, result: Dict[str, Any]) -> None:
+def _dialog_ok(root: tk.Tk, pwd_entry: tk.Entry, user_id_entry: tk.Entry, result: Dict[str, Any]) -> None:
     """Handle OK button click."""
     pwd = pwd_entry.get()
     if not pwd:
         messagebox.showwarning("Password Required", "Please enter a password.", parent=root)
         pwd_entry.focus()
         return
+    user_id = user_id_entry.get().strip()
+    if not user_id:
+        messagebox.showwarning("User ID Required", "Please enter a User ID.", parent=root)
+        user_id_entry.focus()
+        return
     result['password'] = pwd
+    result['user_id'] = user_id
     root.destroy()
 
 
@@ -99,9 +133,19 @@ def _dialog_timeout(root: tk.Tk, result: Dict[str, Any]) -> None:
         pass
 
 
-def prompt_for_user_password(db_name: str, user_id: str, db_type: str = "Oracle") -> Optional[str]:
+def prompt_for_user_password(db_name: str, user_id: str, db_type: str = "Oracle") -> Optional[Tuple[str, str]]:
     """
-    Display a custom password dialog to get user password.
+    Display a custom sign-on dialog to get the user ID and password to
+    authenticate with.
+
+    Connection Type and Database Name are fixed by this invocation and
+    shown read-only. User ID is pre-filled from the registry's cached
+    value but left editable: that cache reflects the last profile/default
+    used with this connection, not necessarily who is actually signing on
+    right now, so the operator can correct it before entering a password.
+
+    Returns:
+        An (password, user_id) tuple on success, or None if cancelled.
     """
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -111,7 +155,7 @@ def prompt_for_user_password(db_name: str, user_id: str, db_type: str = "Oracle"
         except Exception:
             pass
 
-    state = {'password': None, 'cancelled': False, 'timed_out': False}
+    state = {'password': None, 'user_id': None, 'cancelled': False, 'timed_out': False}
 
     root = tk.Tk()
     root.withdraw()
@@ -157,18 +201,22 @@ def prompt_for_user_password(db_name: str, user_id: str, db_type: str = "Oracle"
     main_frame.grid_columnconfigure(0, weight=0)
     main_frame.grid_columnconfigure(1, weight=1)
 
-    for row_idx, (label_text, value_text) in enumerate([
-        ("Connection Type:", db_type),
-        ("Database Name:", db_name),
-        ("User ID:", user_id)
+    user_id_entry = None
+    for row_idx, (field_name, label_text, value_text, editable) in enumerate([
+        ("db_type", "Connection Type:", db_type, False),
+        ("db_name", "Database Name:", db_name, False),
+        ("user_id", "User ID:", user_id, True),
     ]):
         lbl = tk.Label(main_frame, text=label_text, bg='#f0f0f0', font=label_font, anchor='e')
         lbl.grid(row=row_idx, column=0, sticky='e', pady=6, padx=(0, 12))
 
         entry = tk.Entry(main_frame, width=28, font=entry_font)
         entry.insert(0, value_text)
-        entry.configure(state='readonly')
+        if not editable:
+            entry.configure(state='readonly')
         entry.grid(row=row_idx, column=1, sticky='ew', pady=6, padx=(0, 5))
+        if field_name == "user_id":
+            user_id_entry = entry
 
     pwd_lbl = tk.Label(main_frame, text="Password:", bg='#f0f0f0', font=label_font, anchor='e')
     pwd_lbl.grid(row=3, column=0, sticky='e', pady=6, padx=(0, 12))
@@ -177,7 +225,7 @@ def prompt_for_user_password(db_name: str, user_id: str, db_type: str = "Oracle"
     pwd_entry.grid(row=3, column=1, sticky='ew', pady=6, padx=(0, 5))
     pwd_entry.focus()
 
-    pwd_entry.bind('<Return>', lambda e: _dialog_ok(root, pwd_entry, state))
+    pwd_entry.bind('<Return>', lambda e: _dialog_ok(root, pwd_entry, user_id_entry, state))
 
     timeout_msg = (
         f"This sign-on prompt expires after {_PASSWORD_TIMEOUT_SECONDS} seconds. "
@@ -198,7 +246,7 @@ def prompt_for_user_password(db_name: str, user_id: str, db_type: str = "Oracle"
     btn_frame = tk.Frame(main_frame, bg='#f0f0f0')
     btn_frame.grid(row=5, column=0, columnspan=2, pady=(25, 5))
 
-    ok_btn = tk.Button(btn_frame, text="OK", width=10, relief='solid', bd=1, font=button_font, command=lambda: _dialog_ok(root, pwd_entry, state))
+    ok_btn = tk.Button(btn_frame, text="OK", width=10, relief='solid', bd=1, font=button_font, command=lambda: _dialog_ok(root, pwd_entry, user_id_entry, state))
     ok_btn.pack(side='left', padx=8)
 
     cancel_btn = tk.Button(btn_frame, text="Cancel", width=10, relief='solid', bd=1, font=button_font, command=lambda: _dialog_cancel(root, state))
@@ -236,30 +284,32 @@ def prompt_for_user_password(db_name: str, user_id: str, db_type: str = "Oracle"
 
     if state['cancelled']:
         return None
-    return state['password']
+    return state['password'], state['user_id']
 
 
-def get_user_password(db_name: str, user_id: str, db_type: str = "Oracle") -> str:
+def get_user_password(db_name: str, user_id: str, db_type: str = "Oracle") -> Tuple[str, str]:
     """
-    Get user password via UI prompt.
-    
+    Get the user ID and password to authenticate with, via UI prompt.
+
     Args:
         db_name: Database name
-        user_id: User ID
+        user_id: User ID to pre-fill (from the registry's cached value);
+            the dialog lets the operator correct this before signing on.
         db_type: Connection type
-        
+
     Returns:
-        The user password
-        
+        An (password, resolved_user_id) tuple. resolved_user_id reflects
+        whatever the operator confirmed or corrected in the dialog.
+
     Raises:
         RuntimeError: If password is not provided or cancelled
     """
-    user_pwd = prompt_for_user_password(db_name, user_id, db_type)
-    
-    if not user_pwd:
+    result = prompt_for_user_password(db_name, user_id, db_type)
+
+    if not result or not result[0]:
         raise RuntimeError("User password is required. Authentication cancelled.")
-    
-    return user_pwd
+
+    return result
 
 # --- Environment and Configuration ---
 
@@ -546,22 +596,35 @@ def authenticate_database(psaiapi: ctypes.CDLL, ps_home: str, db_name: str, db_t
 def get_psaiapi() -> ctypes.CDLL:
     """
     Get the initialized PSAIAPI instance.
-    
+
+    Blocks the calling tool call, not just this check, while sign-on is
+    still pending: a client that spawns one server per turn (rather than a
+    long-lived server reused across turns) would otherwise see this tool
+    call fail instantly and tear the server -- and the sign-on dialog with
+    it -- down before a human could respond to that dialog.
+
     Returns:
         The initialized PSAIAPI DLL object.
-        
+
     Raises:
         RuntimeError: If PSAIAPI has not been initialized.
     """
+    _touch_activity()
     if _PSAIAPI is None:
         auth_state, auth_error = _get_auth_status()
+        if auth_state == _AUTH_PENDING:
+            if _AUTH_READY_EVENT.wait(timeout=_TOOL_AUTH_WAIT_SECONDS):
+                auth_state, auth_error = _get_auth_status()
+            else:
+                raise RuntimeError(
+                    f"PeopleSoft sign-on did not complete within {_TOOL_AUTH_WAIT_SECONDS}s "
+                    "of this tool call (the sign-on dialog may have expired or is still "
+                    "waiting for input). Retry once sign-on is complete."
+                )
         if auth_state == _AUTH_FAILED:
             raise RuntimeError(f"PeopleSoft authentication failed: {auth_error}")
-        if auth_state == _AUTH_PENDING:
-            raise RuntimeError(
-                "PeopleSoft sign-on is still pending. Complete the password prompt, then retry."
-            )
-        raise RuntimeError("PSAIAPI not initialized even though authentication is marked ready.")
+        if _PSAIAPI is None:
+            raise RuntimeError("PSAIAPI not initialized even though authentication is marked ready.")
     return _PSAIAPI
 
 # --- MCP Tools: Metadata ---
@@ -1676,14 +1739,22 @@ def initialize_server() -> None:
 
         db_name = registry_values["DBName"]
         db_type = registry_values["DBType"]
+        # The registry's cached UserId is this connection's last-used/default
+        # profile, not necessarily who is actually signing on right now; the
+        # sign-on dialog lets the operator correct it, and that correction
+        # (not the registry value) is what gets used to authenticate below.
         user_id = registry_values["UserId"]
         acc_id = registry_values["ConnectIdStd"]
         acc_pwd = registry_values["ClientConnectPswdV2Std"]
-        owner_id = registry_values["UserId"]
 
         db_host, _, _ = parse_tnsnames(tns_admin, db_name)
 
-        user_pwd = os.getenv("USER_PASSWORD","") or get_user_password(db_name, user_id, db_type)
+        env_password = os.getenv("USER_PASSWORD", "")
+        if env_password:
+            user_pwd = env_password
+        else:
+            user_pwd, user_id = get_user_password(db_name, user_id, db_type)
+        owner_id = user_id
 
         psaiapi = load_psaiapi_dll(ps_home)
         configure_dll_functions(psaiapi)
@@ -1735,6 +1806,28 @@ def _warmup_server() -> None:
         os._exit(1)
 
 
+def _touch_activity() -> None:
+    """Record that a tool call happened, for the idle-shutdown watchdog."""
+    global _LAST_ACTIVITY
+    with _ACTIVITY_LOCK:
+        _LAST_ACTIVITY = time.time()
+
+
+def _idle_shutdown_watchdog() -> None:
+    """For a persistent (streamable-http) server: exit once no tool call has
+    happened for _IDLE_SHUTDOWN_SECONDS, so an abandoned server doesn't hold
+    a live database session open indefinitely. Not used for stdio, where the
+    client process that spawned this one already bounds its lifetime."""
+    check_interval = min(60.0, max(1.0, _IDLE_SHUTDOWN_SECONDS / 10))
+    while True:
+        time.sleep(check_interval)
+        with _ACTIVITY_LOCK:
+            idle_for = time.time() - _LAST_ACTIVITY
+        if idle_for >= _IDLE_SHUTDOWN_SECONDS:
+            sign_off_database()
+            os._exit(0)
+
+
 # --- Entry Point ---
 
 def main() -> None:
@@ -1771,10 +1864,15 @@ def main() -> None:
         mcp.tool()(clear_staged_peoplecode)
         mcp.tool()(save_all_peoplecode)
 
+    _touch_activity()
+    if _TRANSPORT == "streamable-http":
+        watchdog = threading.Thread(target=_idle_shutdown_watchdog, daemon=True)
+        watchdog.start()
+
     warmup_timer = threading.Timer(_WARMUP_DELAY_SECONDS, _warmup_server)
     warmup_timer.daemon = True
     warmup_timer.start()
-    mcp.run()
+    mcp.run(transport=_TRANSPORT)
 
 
 if __name__ == "__main__":

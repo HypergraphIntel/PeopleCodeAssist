@@ -4,7 +4,11 @@ Place this next to Oracle's llm_plugin_base.py in PeopleCodeAssist/Plugins.
 Requires authenticated OpenAI Codex CLI on PATH and Python 3.12+ on Windows.
 Initial implementation is intentionally READ-ONLY; disable write-back in PSIDE.
 PeopleSoft metadata/PeopleCode access goes through the MCPServers/ps_mcp_server.py
-MCP server (MODE=read), not through file/shell tools.
+MCP server (MODE=read), not through file/shell tools. PSIDE spawns a brand new
+plugin process per "Ask AI" turn, so that server runs as a persistent
+background process (see LLMPluginBase.ensure_mcp_server_running) reused across
+turns, rather than as this process's own child: a fresh server per turn would
+mean re-authenticating to the database on every single question.
 
 Mirrors llm_plugin_claude.py's shape and MCP hookup; see that file for the
 rationale behind the bounded-context + MCP-tool split. Codex CLI has no
@@ -39,9 +43,10 @@ TEXT_EXTENSIONS = {
 
 # PeopleSoft metadata/PeopleCode server (PSAIAPI-backed). MODE=read registers
 # only the get_*_details/get_*_peoplecode tools -- no compile/stage/save --
-# since write-back is not implemented by this adapter yet.
+# since write-back is not implemented by this adapter yet. Runs persistently
+# on localhost (see ensure_mcp_server_running), not as this process's child.
 MCP_SERVER_NAME = "psoft"
-MCP_SERVER_SCRIPT = Path(__file__).resolve().parent.parent / "MCPServers" / "ps_mcp_server.py"
+MCP_SERVER_PORT = 8933
 
 # peoplecode-generation Skill, bundled statically since this session has no
 # file/shell tool to load it on demand the way Skill.md itself describes
@@ -144,21 +149,19 @@ def _toml_literal(value):
 
 class CodexPlugin(LLMPluginBase):
     def mcp_config_overrides(self):
-        """Build the -c key=value pairs wiring up the PeopleSoft MCP server.
+        """Build the -c key=value pairs pointing Codex at the persistent
+        PeopleSoft MCP server, starting that server if it isn't already
+        running (see LLMPluginBase.ensure_mcp_server_running).
 
         Codex CLI has no one-off --mcp-config file flag; config.toml entries
         are set per invocation with `-c dotted.key=value` overrides instead,
         same as everything else below that would otherwise live in config.toml.
         """
-        if not MCP_SERVER_SCRIPT.is_file():
-            raise FileNotFoundError(f"MCP server script not found: {MCP_SERVER_SCRIPT}")
+        server_url = self.ensure_mcp_server_running(MCP_SERVER_PORT, mode="read")
 
         prefix = f"mcp_servers.{MCP_SERVER_NAME}"
         overrides = [
-            f"{prefix}.command={_toml_literal(sys.executable)}",
-            f"{prefix}.args=[{_toml_literal(str(MCP_SERVER_SCRIPT))}]",
-            f"{prefix}.env.MODE={_toml_literal('read')}",
-            f"{prefix}.startup_timeout_sec=20",
+            f"{prefix}.url={_toml_literal(server_url)}",
         ]
         args = []
         for override in overrides:

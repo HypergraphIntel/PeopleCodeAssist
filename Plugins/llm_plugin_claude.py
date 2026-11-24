@@ -4,7 +4,11 @@ Place this next to Oracle's llm_plugin_base.py in PeopleCodeAssist/Plugins.
 Requires authenticated Claude Code CLI and Python 3.12+ on Windows.
 Initial implementation is intentionally READ-ONLY; disable write-back in PSIDE.
 PeopleSoft metadata/PeopleCode access goes through the MCPServers/ps_mcp_server.py
-MCP server (MODE=read), not through file/shell tools.
+MCP server (MODE=read), not through file/shell tools. PSIDE spawns a brand new
+plugin process per "Ask AI" turn, so that server runs as a persistent
+background process (see LLMPluginBase.ensure_mcp_server_running) reused across
+turns, rather than as this process's own stdio child: a fresh server per turn
+would mean re-authenticating to the database on every single question.
 """
 
 import argparse
@@ -33,9 +37,10 @@ TEXT_EXTENSIONS = {
 
 # PeopleSoft metadata/PeopleCode server (PSAIAPI-backed). MODE=read registers
 # only the get_*_details/get_*_peoplecode tools -- no compile/stage/save --
-# since write-back is not implemented by this adapter yet.
+# since write-back is not implemented by this adapter yet. Runs persistently
+# on localhost (see ensure_mcp_server_running), not as this process's child.
 MCP_SERVER_NAME = "psoft"
-MCP_SERVER_SCRIPT = Path(__file__).resolve().parent.parent / "MCPServers" / "ps_mcp_server.py"
+MCP_SERVER_PORT = 8933
 
 # peoplecode-generation Skill, bundled statically since this session has no
 # file/shell tool to load it on demand the way Skill.md itself describes
@@ -132,27 +137,29 @@ def load_skill_reference():
 
 class ClaudePlugin(LLMPluginBase):
     def build_mcp_config(self):
-        """Write a one-off --mcp-config file wiring up the PeopleSoft MCP server.
+        """Write a one-off --mcp-config file pointing at the persistent
+        PeopleSoft MCP server, starting that server if it isn't already
+        running (see LLMPluginBase.ensure_mcp_server_running).
 
-        A fresh file is written per invocation (into context_cache_dir, which
-        App Designer already creates per session) rather than relying on any
-        shared/committed .mcp.json, matching --strict-mcp-config below.
+        A fresh config file is written per invocation (into
+        context_cache_dir, which App Designer already creates per session)
+        rather than relying on any shared/committed .mcp.json, matching
+        --strict-mcp-config below -- but the server it points at is the same
+        long-lived one across every turn.
         """
-        if not MCP_SERVER_SCRIPT.is_file():
-            raise FileNotFoundError(f"MCP server script not found: {MCP_SERVER_SCRIPT}")
+        server_url = self.ensure_mcp_server_running(MCP_SERVER_PORT, mode="read")
 
         config = {
             "mcpServers": {
                 MCP_SERVER_NAME: {
-                    "command": sys.executable,
-                    "args": [str(MCP_SERVER_SCRIPT)],
-                    "env": {"MODE": "read"},
+                    "type": "http",
+                    "url": server_url,
                 }
             }
         }
         config_path = self.context_dir / "mcp_config.json"
         config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-        logging.info("Wrote MCP config for server '%s' to %s", MCP_SERVER_NAME, config_path)
+        logging.info("Wrote MCP config for server '%s' (%s) to %s", MCP_SERVER_NAME, server_url, config_path)
         return config_path
 
     def build_command(self):

@@ -1,6 +1,11 @@
 import json
 import os
 import re
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
 
 
 class LLMPluginExitCodes:
@@ -75,3 +80,65 @@ class LLMPluginBase:
             return True, target_file
         except Exception as e:
             return False, str(e)
+
+    @staticmethod
+    def _mcp_port_open(port, timeout=0.3):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+
+    def ensure_mcp_server_running(self, port, mode="read", startup_timeout=15.0):
+        """Make sure the shared PeopleSoft MCP server (MCPServers/ps_mcp_server.py)
+        is listening on `port`, starting it as a detached background process
+        if nothing answers there yet, and return its base URL.
+
+        Every "Ask AI" turn spawns a brand-new plugin (and LLM CLI) process,
+        but the MCP server stays up across turns once started here: tool
+        calls in a later turn reuse the same already-authenticated session
+        instead of re-running the sign-on dialog from scratch each time.
+        Started detached (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP on
+        Windows) so it outlives this short-lived launcher process; it exits
+        itself after IDLE_SHUTDOWN_SECONDS of inactivity (see ps_mcp_server.py).
+        """
+        if not self._mcp_port_open(port):
+            script = Path(__file__).resolve().parent.parent / "MCPServers" / "ps_mcp_server.py"
+            if not script.is_file():
+                raise FileNotFoundError(f"MCP server script not found: {script}")
+
+            env = os.environ.copy()
+            env["TRANSPORT"] = "streamable-http"
+            env["PORT"] = str(port)
+            env["MODE"] = mode
+
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+
+            subprocess.Popen(
+                [sys.executable, str(script)],
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+                close_fds=True,
+            )
+
+            deadline = time.time() + startup_timeout
+            while time.time() < deadline:
+                if self._mcp_port_open(port):
+                    break
+                time.sleep(0.2)
+            else:
+                raise RuntimeError(
+                    f"PeopleSoft MCP server did not start listening on port {port} "
+                    f"within {startup_timeout}s"
+                )
+
+        return f"http://127.0.0.1:{port}/mcp"
