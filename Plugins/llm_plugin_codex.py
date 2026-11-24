@@ -43,6 +43,33 @@ TEXT_EXTENSIONS = {
 MCP_SERVER_NAME = "psoft"
 MCP_SERVER_SCRIPT = Path(__file__).resolve().parent.parent / "MCPServers" / "ps_mcp_server.py"
 
+# peoplecode-generation Skill, bundled statically since this session has no
+# file/shell tool to load it on demand the way Skill.md itself describes
+# (its lookup_peoplecode_reference script needs a shell tool we don't grant).
+SKILL_DIR = Path(__file__).resolve().parent.parent / "Skills" / "peoplecode-generation"
+SKILL_REFERENCE_FILES = [
+    "references/syntax/01_core/core_rules_and_quality.md",
+    "references/syntax/02_control_flow/control_flow.md",
+    "references/syntax/03_functions/functions_and_declarations.md",
+    "references/syntax/04_objects_and_classes/application_classes_and_imports.md",
+    "references/syntax/04_objects_and_classes/class_definition_examples.md",
+    "references/syntax/04_objects_and_classes/objects_properties_methods.md",
+    "references/syntax/05_data_and_sql/data_buffer_rowset_patterns.md",
+    "references/syntax/05_data_and_sql/sql_patterns_and_security.md",
+    "references/peoplecode_built_in_functions_by_category.md",
+]
+SKILL_NOTICE = (
+    "SKILL REFERENCE (peoplecode-generation, bundled statically below -- "
+    "this session has no file or shell tool to fetch it on demand): use "
+    "verified PeopleCode built-in names, signatures, and return types from "
+    "the catalog below; do not invent them. The catalog lists built-ins by "
+    "category and name only -- this session cannot run the "
+    "lookup_peoplecode_reference script that fetches exact signatures, so "
+    "if a built-in's exact signature matters and isn't already obvious "
+    "from the category listing or the syntax references, say so explicitly "
+    "rather than guessing."
+)
+
 TOOLS_NOTICE = (
     "SYSTEM NOTE: this session has no file or shell tool access. The only "
     f"tool available is the PeopleSoft metadata/PeopleCode server, as "
@@ -88,6 +115,20 @@ def load_text_file(path, remaining):
     return f"\n--- BEGIN FILE: {p} ---\n{content}\n--- END FILE ---\n", size
 
 
+def load_skill_reference():
+    """Bundle the peoplecode-generation skill's reference files as static text."""
+    sections = [SKILL_NOTICE]
+    for rel_path in SKILL_REFERENCE_FILES:
+        path = SKILL_DIR / rel_path
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            logging.warning("Skill reference file missing: %s", path)
+            continue
+        sections.append(f"\n--- BEGIN SKILL REFERENCE: {rel_path} ---\n{text}\n--- END SKILL REFERENCE ---\n")
+    return "\n".join(sections)
+
+
 def _toml_literal(value):
     """Render a string as a TOML literal string (single-quoted, no escaping).
 
@@ -127,6 +168,23 @@ class CodexPlugin(LLMPluginBase):
     def build_command(self):
         a = self.plugin_attributes
         if "enable_write" in a:
+            # TODO(write-mode): before implementing this, confirm how PSIDE
+            # actually persists a write-enabled change once the plugin exits:
+            # (a) file roundtrip -- PSIDE re-reads write_enabled_files from
+            #     disk and compiles/saves them itself, same as Cline/Aider
+            #     (WRITE_MODE_AGENTS.md's "only modify existing files" rule
+            #     points this way) -- in which case Codex needs a plain
+            #     apply-patch capability scoped to just those files, not the
+            #     MCP save tools; or
+            # (b) MCP stage/save -- the plugin itself must push the change via
+            #     ps_mcp_server.py's stage_*_peoplecode + save_all_peoplecode
+            #     (UpdateMultiPeopleCodeData), independent of the local files.
+            # Picking wrong means write-mode silently no-ops or double-applies.
+            # No shipped doc under PS_HOME settles this (checked); the
+            # empirical test is: enable write-back, run the existing Cline
+            # adapter on a trivial change, and see whether the DB object
+            # updates with no further action once write_enabled_files changed
+            # on disk. See memory `peoplecodeassist-write-mode-question`.
             raise ValueError(
                 "Write-back is not supported by this read-only Codex adapter. "
                 "Uncheck Enable write-back mode in Application Designer."
@@ -161,7 +219,7 @@ class CodexPlugin(LLMPluginBase):
             fragments.append(content)
             budget -= used
 
-        sections = [TOOLS_NOTICE, rule_text.strip(), user_prompt.strip()]
+        sections = [TOOLS_NOTICE, rule_text.strip(), load_skill_reference(), user_prompt.strip()]
         sections.extend(fragment for fragment in fragments if fragment)
         self.input_text = "\n\n".join(sections) + "\n"
 
